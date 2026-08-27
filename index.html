@@ -394,7 +394,11 @@ canvas{max-width:100%;}
           <div class="value down" id="churn-valor" style="font-size:24px;">—</div>
         </div>
       </div>
-      <div class="table-scroll">
+
+      <h3 style="margin-bottom:6px;">Evolução do churn por mês <span class="muted">— quantidade de clientes, Segmento/Empresa selecionados</span></h3>
+      <canvas id="chart-churn-mensal" height="80"></canvas>
+
+      <div class="table-scroll" style="margin-top:18px;">
         <table>
           <thead><tr><th>Cliente</th><th class="num">Faturado em 2025 (mês)</th><th>Status</th></tr></thead>
           <tbody id="tbl-churn-mes"></tbody>
@@ -1100,6 +1104,31 @@ function renderChurnMes(pd, mKey){
   });
 
   document.getElementById('churn-empresa-mes-label').textContent = info.mes + '/2026';
+
+  // Evolução do churn por mês (Jan–Jun), respeitando Segmento e Empresa do cabeçalho.
+  // Sempre mostra o semestre completo para dar contexto de tendência, destacando o mês em análise.
+  const selIdxChurn = MONTHS_ORD.indexOf(info.mes);
+  const churnCounts = MONTHS_ORD.map((_,i)=> pd.churn_by_month[i+1] ? pd.churn_by_month[i+1].clientes_churn : 0);
+  const churnPcts = MONTHS_ORD.map((_,i)=> pd.churn_by_month[i+1] ? pd.churn_by_month[i+1].pct_churn : 0);
+  const churnBarColors = MONTHS_ORD.map((_,i)=> i===selIdxChurn ? PALETTE.amber : PALETTE.rose);
+  destroyChart('churnMensal');
+  charts.churnMensal = new Chart(document.getElementById('chart-churn-mensal'), {
+    type:'bar',
+    data:{labels:MONTHS_ORD, datasets:[
+      {label:'Clientes em churn', data:churnCounts, backgroundColor:churnBarColors, borderRadius:5, barPercentage:.55, yAxisID:'y'},
+      {type:'line', label:'% churn', data:churnPcts, borderColor:PALETTE.navy, backgroundColor:PALETTE.navy, tension:.3, pointRadius:4, borderWidth:2, borderDash:[4,3], yAxisID:'y1'}
+    ]},
+    options:{
+      plugins:{legend:{position:'bottom', labels:{boxWidth:10,usePointStyle:true}},
+        tooltip:{callbacks:{label:c=> c.dataset.yAxisID==='y1' ? ('% churn: '+c.parsed.y.toFixed(1)+'%') : ('Clientes em churn: '+c.parsed.y)}}},
+      scales:{
+        y:{beginAtZero:true, ticks:{stepSize:Math.max(1,Math.round(Math.max(...churnCounts)/6)) , precision:0}, grid:{color:'#f0f1f6'}, title:{display:true,text:'nº clientes'}},
+        y1:{beginAtZero:true, position:'right', ticks:{callback:v=>v+'%'}, grid:{display:false}, title:{display:true,text:'% churn'}},
+        x:{grid:{display:false}}
+      }
+    }
+  });
+
   const sectionEl = document.getElementById('churn-empresa-section');
   const hiddenMsg = document.getElementById('churn-empresa-hidden-msg');
 
