@@ -298,8 +298,8 @@ canvas{max-width:100%;}
     <button id="btn-refresh-data" class="btn-refresh">🔄 Atualizar dados do Google Drive</button>
     <span id="refresh-status" class="refresh-status">Dados carregados no momento da geração deste painel — clique para buscar a versão mais recente das planilhas.</span>
   </div>
-  <div id="manual-upload-wrap" class="manual-upload" style="display:none;">
-    <span>Não foi possível atualizar automaticamente. Baixe as planilhas do Drive (Arquivo → Fazer download → .xlsx) e selecione aqui:</span>
+  <div id="manual-upload-wrap" class="manual-upload">
+    <span>Alternativa garantida: baixe as planilhas do Drive (Arquivo → Fazer download → .xlsx) e selecione aqui:</span>
     <label class="upload-label">Varejo <input type="file" id="upload-varejo" accept=".xlsx"></label>
     <label class="upload-label">Levantamento <input type="file" id="upload-metas" accept=".xlsx"></label>
     <button id="btn-manual-process" class="btn-refresh">Processar arquivos</button>
@@ -1512,11 +1512,23 @@ function fetchGviz(fileId, sheetName, timeoutMs, range){
     const cbName = 'gvizCB_' + (gvizCbCounter++) + '_' + Date.now();
     const timer = setTimeout(()=>{ cleanup(); reject(new Error('Tempo esgotado ao carregar "'+sheetName+'"')); }, timeoutMs||20000);
     function cleanup(){ delete window[cbName]; if(script.parentNode) script.parentNode.removeChild(script); clearTimeout(timer); }
-    window[cbName] = (data) => { cleanup(); resolve(data); };
+    window[cbName] = (data) => {
+      cleanup();
+      if(!data){ reject(new Error('Resposta vazia para "'+sheetName+'"')); return; }
+      if(data.status === 'error'){
+        const msg = (data.errors && data.errors[0] && (data.errors[0].detailed_message || data.errors[0].message)) || 'erro desconhecido';
+        reject(new Error('Google Sheets recusou a aba "'+sheetName+'": '+msg));
+        return;
+      }
+      resolve(data);
+    };
     let url = 'https://docs.google.com/spreadsheets/d/'+fileId+'/gviz/tq?headers=0&tqx=out:json;responseHandler:'+cbName+'&sheet='+encodeURIComponent(sheetName);
     // Explicit range forces gviz to return a grid anchored at the requested top-left cell,
     // instead of auto-trimming blank leading rows/columns (which would silently shift every index).
     if(range) url += '&range=' + encodeURIComponent(range);
+    // Cache-buster: Google's gviz endpoint can serve a cached response for a short while after an
+    // edit; a unique, ever-changing param forces it to recompute against the live sheet.
+    url += '&_cb=' + Date.now() + Math.random().toString(36).slice(2);
     const script = document.createElement('script');
     script.src = url;
     script.onerror = ()=>{ cleanup(); reject(new Error('Não foi possível carregar a aba "'+sheetName+'" (verifique se a planilha continua compartilhada como "Qualquer pessoa com o link")')); };
@@ -1645,6 +1657,22 @@ function buildCompactFromTxns(txns){
 }
 function round2(v){ return Math.round(v*100)/100; }
 
+// ---------- Alternate live method: direct workbook export + fetch + SheetJS ----------
+// Used automatically if the gviz JSONP method fails (e.g. blocked by network policy).
+async function fetchWorkbookViaExport(fileId){
+  const url = 'https://docs.google.com/spreadsheets/d/'+fileId+'/export?format=xlsx&_cb='+Date.now();
+  const resp = await fetch(url, {cache:'no-store'});
+  if(!resp.ok) throw new Error('HTTP '+resp.status+' ao baixar planilha (id '+fileId+')');
+  const buf = await resp.arrayBuffer();
+  return XLSX.read(buf, {type:'array', cellDates:true});
+}
+
+function detectedMonthsLabel(txns){
+  const found = new Set();
+  txns.forEach(t=> found.add(t.ano+'-'+String(t.mes).padStart(2,'0')));
+  return Array.from(found).sort().join(', ');
+}
+
 // ================= Orchestration =================
 async function refreshDataFromGoogleSheets(){
   const btn = document.getElementById('btn-refresh-data');
@@ -1652,10 +1680,17 @@ async function refreshDataFromGoogleSheets(){
   btn.disabled = true;
   const origLabel = btn.textContent;
   btn.textContent = '⏳ Atualizando...';
-  statusEl.textContent = 'Buscando planilhas no Google Drive...';
   statusEl.style.color = '';
 
+  let txns = null;
+  let metas_2026 = null;
+  let vendorRecords = null;
+  let methodUsed = '';
+  const diagnostics = [];
+
+  // ---- Attempt 1: gviz JSONP (bypasses CORS via <script> tag) ----
   try {
+    statusEl.textContent = 'Tentando método 1 (Google Visualization API)...';
     const [demRows, balRows, orgRows, globRows, metasRows, vendRows] = await Promise.all([
       fetchGviz(SHEET_ID_VAREJO, 'DEMONSTRATIVO').then(gvizToRows),
       fetchGviz(SHEET_ID_VAREJO, 'BALSAS').then(gvizToRows),
@@ -1664,23 +1699,56 @@ async function refreshDataFromGoogleSheets(){
       fetchGviz(SHEET_ID_METAS, 'METAS X REALIZADOS EXECUTIVOS 2', undefined, 'A1:P60').then(gvizToRows),
       fetchGviz(SHEET_ID_METAS, 'FLASF FM E NEWS 2026', undefined, 'A1:J260').then(gvizToRows),
     ]);
+    diagnostics.push('DEMONSTRATIVO:'+demRows.length, 'BALSAS:'+balRows.length, 'ORG PUBLICO:'+orgRows.length, 'GLOBO:'+globRows.length);
 
-    statusEl.textContent = 'Processando dados...';
-
-    let txns = [];
+    txns = [];
     txns = txns.concat(parseVarejoRows(demRows, false, 'Varejo/Comercial'));
     txns = txns.concat(parseVarejoRows(balRows, true, 'Varejo/Comercial'));
     txns = txns.concat(parseVarejoRows(orgRows, true, 'Publico'));
     txns = txns.concat(parseVarejoRows(globRows, true, 'Globo'));
-
     if(txns.length < 100) throw new Error('Poucos registros encontrados ('+txns.length+') — a estrutura da planilha pode ter mudado.');
 
+    metas_2026 = readMetaBlockLive(metasRows, 3, 5);
+    vendorRecords = parseVendorsRows(vendRows);
+    methodUsed = 'Google Visualization API';
+  } catch(err1){
+    console.warn('Método 1 (gviz) falhou:', err1);
+    diagnostics.push('Método 1 falhou: '+err1.message);
+
+    // ---- Attempt 2: direct workbook export + fetch + SheetJS ----
+    try {
+      statusEl.textContent = 'Método 1 falhou, tentando método 2 (download direto)...';
+      const [wbVarejo, wbMetas] = await Promise.all([
+        fetchWorkbookViaExport(SHEET_ID_VAREJO),
+        fetchWorkbookViaExport(SHEET_ID_METAS)
+      ]);
+      txns = [];
+      txns = txns.concat(parseVarejoRowsXLSX(sheetToRowsXLSX(wbVarejo,'DEMONSTRATIVO'), false, 'Varejo/Comercial'));
+      txns = txns.concat(parseVarejoRowsXLSX(sheetToRowsXLSX(wbVarejo,'BALSAS'), true, 'Varejo/Comercial'));
+      txns = txns.concat(parseVarejoRowsXLSX(sheetToRowsXLSX(wbVarejo,'ORG PUBLICO'), true, 'Publico'));
+      txns = txns.concat(parseVarejoRowsXLSX(sheetToRowsXLSX(wbVarejo,'GLOBO'), true, 'Globo'));
+      if(txns.length < 100) throw new Error('Poucos registros encontrados ('+txns.length+').');
+
+      const metasRowsX = sheetToRowsXLSX(wbMetas, 'METAS X REALIZADOS EXECUTIVOS 2', 'A1:P60');
+      metas_2026 = readMetaBlockLive(metasRowsX, 3, 5);
+      const vendRowsX = sheetToRowsXLSX(wbMetas, 'FLASF FM E NEWS 2026', 'A1:J260');
+      vendorRecords = parseVendorsRows(vendRowsX);
+      methodUsed = 'download direto';
+    } catch(err2){
+      console.error('Método 2 (download direto) também falhou:', err2);
+      statusEl.style.color = 'var(--rose)';
+      statusEl.textContent = '✗ Falha ao atualizar automaticamente — método 1: '+err1.message+' · método 2: '+err2.message+'. Use o upload manual abaixo, que funciona de forma garantida.';
+      btn.disabled = false;
+      btn.textContent = origLabel;
+      return;
+    }
+  }
+
+  try {
     const newCompact = buildCompactFromTxns(txns);
 
-    const metas_2026 = readMetaBlockLive(metasRows, 3, 5);
     const newMetas2 = {meses: metas2.meses, metas_2026, meta_2026_janjun_total: Object.keys(metas_2026).reduce((s,c)=> s + metas_2026[c].mensal.slice(0,6).reduce((a,b)=>a+b,0), 0)};
 
-    const vendorRecords = parseVendorsRows(vendRows);
     const vendorRanking = {};
     vendorRecords.forEach(rec=>{
       const v = rec.vendedor.toUpperCase().trim();
@@ -1711,16 +1779,16 @@ async function refreshDataFromGoogleSheets(){
 
     const now = new Date();
     const stamp = now.toLocaleDateString('pt-BR') + ' ' + now.toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
+    const monthsFound = detectedMonthsLabel(txns);
     statusEl.style.color = 'var(--teal)';
-    statusEl.textContent = '✓ Dados atualizados às ' + stamp + ' (' + txns.length + ' lançamentos)';
+    statusEl.textContent = '✓ Atualizado às ' + stamp + ' via ' + methodUsed + ' — ' + txns.length + ' lançamentos. Meses detectados: ' + monthsFound;
     document.getElementById('hdr-updated-at').textContent = stamp;
 
     renderAll();
   } catch(err){
-    console.error('Refresh error:', err);
+    console.error('Erro ao processar dados após busca bem-sucedida:', err);
     statusEl.style.color = 'var(--rose)';
-    statusEl.textContent = '✗ Falha ao atualizar: ' + err.message + '. Use o upload manual abaixo como alternativa.';
-    document.getElementById('manual-upload-wrap').style.display = '';
+    statusEl.textContent = '✗ Os dados foram baixados mas houve erro ao processá-los: ' + err.message;
   } finally {
     btn.disabled = false;
     btn.textContent = origLabel;
@@ -1816,8 +1884,9 @@ async function handleManualUpload(){
 
     const now = new Date();
     const stamp = now.toLocaleDateString('pt-BR') + ' ' + now.toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
+    const monthsFound = detectedMonthsLabel(txns);
     statusEl.style.color = 'var(--teal)';
-    statusEl.textContent = '✓ Dados atualizados a partir dos arquivos locais às ' + stamp + ' (' + txns.length + ' lançamentos)';
+    statusEl.textContent = '✓ Dados atualizados a partir dos arquivos locais às ' + stamp + ' (' + txns.length + ' lançamentos). Meses detectados: ' + monthsFound;
     document.getElementById('hdr-updated-at').textContent = stamp;
     renderAll();
   } catch(err){
