@@ -570,8 +570,17 @@ canvas{max-width:100%;}
       <div class="footnote" id="novos-footnote"></div>
     </div>
 
+    <div class="card" style="margin-top:14px;">
+      <h3>Evolução mês a mês <span class="muted">— receita perdida × receita nova, período completo detectado</span></h3>
+      <canvas id="chart-compensacao-mensal" height="90"></canvas>
+    </div>
+
     <div class="section-title">Top 15 clientes novos <span class="muted">por valor faturado em 2026</span></div>
     <div class="card">
+      <div class="toolbar" id="novos-mes-toolbar">
+        <label id="novos-mes-label" style="font-size:12px;color:var(--muted);font-weight:600;">Detalhar por mês:</label>
+        <select id="sel-mes-novos"></select>
+      </div>
       <div id="bars-new-clients"></div>
     </div>
 
@@ -981,7 +990,7 @@ function renderAll(){
   renderPanorama(pd, segTxt, empTxt);
   renderMetas(pd, segTxt, empTxt);
   renderClientes(pd, segTxt, empTxt);
-  renderNovosClientes(pd, segTxt, empTxt);
+  renderNovosClientes(pd, clientsMap, segTxt, empTxt);
   renderVendedores();
   renderInsights(pd, segTxt, empTxt);
 }
@@ -1286,7 +1295,7 @@ function renderClientes(pd, segTxt, empTxt){
 }
 
 // ================= CLIENTES NOVOS (comparação com receita perdida) =================
-function renderNovosClientes(pd, segTxt, empTxt){
+function renderNovosClientes(pd, clientsMap, segTxt, empTxt){
   try {
     const perdida = pd.full_churn.reduce((a,b)=>a+b.valor_2025,0);
     const nova = pd.new_clients.reduce((a,b)=>a+b.valor_2026,0);
@@ -1331,40 +1340,87 @@ function renderNovosClientes(pd, segTxt, empTxt){
       ? 'No filtro atual ('+segTxt+' · '+empTxt+' · '+periodRangeText()+'), a receita trazida por clientes novos supera em '+fmtBRL(Math.abs(saldo),{abbr:true})+' a receita perdida com clientes que saíram — a carteira está crescendo em número de contas.'
       : 'No filtro atual ('+segTxt+' · '+empTxt+' · '+periodRangeText()+'), a receita perdida com clientes que saíram é '+fmtBRL(Math.abs(saldo),{abbr:true})+' maior do que a receita trazida por clientes novos — a entrada de novas contas ainda não repõe o que foi perdido.';
 
-    document.getElementById('new-clients-count').textContent = fmtNum(pd.new_clients.length)+' clientes novos';
+    // ---- Monthly trend: perdida x nova, always full detected range, selected month highlighted ----
+    const monthLabelsNow = currentMonthLabels();
+    const selIdxNovos = currentPeriod==='Todos' ? -1 : AVAILABLE_MONTHS.indexOf(parseInt(currentPeriod,10));
+    const monthlyPerdida = [], monthlyNova = [];
+    AVAILABLE_MONTHS.forEach(m=>{
+      const mpd = computeAnalytics(clientsMap, String(m));
+      monthlyPerdida.push(mpd.full_churn.reduce((a,b)=>a+b.valor_2025,0));
+      monthlyNova.push(mpd.new_clients.reduce((a,b)=>a+b.valor_2026,0));
+    });
+    const perdidaColors = AVAILABLE_MONTHS.map((_,i)=> i===selIdxNovos ? PALETTE.navy : PALETTE.rose);
+    const novaColors = AVAILABLE_MONTHS.map((_,i)=> i===selIdxNovos ? PALETTE.amber : PALETTE.teal);
+    destroyChart('compensacaoMensal');
+    charts.compensacaoMensal = new Chart(document.getElementById('chart-compensacao-mensal'), {
+      type:'bar',
+      data:{labels:monthLabelsNow, datasets:[
+        {label:'Receita perdida', data:monthlyPerdida, backgroundColor:perdidaColors, borderRadius:4},
+        {label:'Receita nova', data:monthlyNova, backgroundColor:novaColors, borderRadius:4}
+      ]},
+      options:{plugins:{legend:{position:'bottom', labels:{boxWidth:10,usePointStyle:true}}},
+        scales:{y:{ticks:{callback:v=>fmtBRL(v,{abbr:true})}, grid:{color:'#f0f1f6'}}, x:{grid:{display:false}}}}
+    });
 
-    const barsNewEl = document.getElementById('bars-new-clients');
-    if(!pd.new_clients.length){
-      barsNewEl.innerHTML = '<p class="section-sub" style="margin:0;">Nenhum cliente novo neste filtro.</p>';
-    } else {
-      const topNew = pd.new_clients.slice(0,15);
-      const maxNew = Math.max(...topNew.map(c=>c.valor_2026));
-      barsNewEl.innerHTML = topNew.map(c=>{
-        const pct = (c.valor_2026/maxNew*100).toFixed(1);
-        return '<div class="bar-row"><div class="bar-label" title="'+c.nome+'">'+c.nome+'</div>'+
-          '<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%;background:'+PALETTE.blue+'"></div></div>'+
-          '<div class="bar-val">'+fmtBRL(c.valor_2026,{abbr:true})+'</div></div>';
-      }).join('');
-    }
-
-    function renderNewClientsTable(){
-      const q = (document.getElementById('search-new-clientes').value||'').trim().toUpperCase();
-      let list = pd.new_clients;
-      if(q) list = list.filter(c=>c.nome.toUpperCase().includes(q));
-      const tblNew = document.getElementById('tbl-new-clients');
-      tblNew.innerHTML = '';
-      if(!list.length){
-        tblNew.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--muted);padding:16px;">Nenhum cliente novo encontrado.</td></tr>';
+    // ---- Local month drill-down for the lists below (Top 15 + full table) ----
+    const selMesNovos = document.getElementById('sel-mes-novos');
+    const toolbarNovos = document.getElementById('novos-mes-toolbar');
+    if(currentPeriod === 'Todos'){
+      toolbarNovos.style.display = '';
+      if(!selMesNovos.options.length || selMesNovos.dataset.builtFor !== AVAILABLE_MONTHS.join(',')){
+        selMesNovos.innerHTML = '';
+        const optAll = document.createElement('option'); optAll.value = 'Todos'; optAll.textContent = 'Todo o período';
+        selMesNovos.appendChild(optAll);
+        AVAILABLE_MONTHS.forEach(m=>{
+          const opt = document.createElement('option'); opt.value = String(m); opt.textContent = PERIOD_LABELS_ALL[String(m)];
+          selMesNovos.appendChild(opt);
+        });
+        selMesNovos.dataset.builtFor = AVAILABLE_MONTHS.join(',');
+        selMesNovos.value = 'Todos';
       }
-      list.slice(0,200).forEach(c=>{
-        const tr = document.createElement('tr');
-        tr.innerHTML = '<td class="name-cell">'+c.nome+'</td><td class="num">'+fmtBRL(c.valor_2026)+'</td>';
-        tblNew.appendChild(tr);
-      });
+      selMesNovos.onchange = ()=> renderNovosLists(selMesNovos.value === 'Todos' ? pd : computeAnalytics(clientsMap, selMesNovos.value));
+      renderNovosLists(selMesNovos.value === 'Todos' ? pd : computeAnalytics(clientsMap, selMesNovos.value));
+    } else {
+      toolbarNovos.style.display = 'none';
+      renderNovosLists(pd);
     }
-    document.getElementById('search-new-clientes').oninput = renderNewClientsTable;
-    renderNewClientsTable();
   } catch(err){ console.error('Novos clientes render error:', err); }
+}
+
+function renderNovosLists(pdForLists){
+  document.getElementById('new-clients-count').textContent = fmtNum(pdForLists.new_clients.length)+' clientes novos';
+
+  const barsNewEl = document.getElementById('bars-new-clients');
+  if(!pdForLists.new_clients.length){
+    barsNewEl.innerHTML = '<p class="section-sub" style="margin:0;">Nenhum cliente novo neste filtro.</p>';
+  } else {
+    const topNew = pdForLists.new_clients.slice(0,15);
+    const maxNew = Math.max(...topNew.map(c=>c.valor_2026));
+    barsNewEl.innerHTML = topNew.map(c=>{
+      const pct = (c.valor_2026/maxNew*100).toFixed(1);
+      return '<div class="bar-row"><div class="bar-label" title="'+c.nome+'">'+c.nome+'</div>'+
+        '<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%;background:'+PALETTE.blue+'"></div></div>'+
+        '<div class="bar-val">'+fmtBRL(c.valor_2026,{abbr:true})+'</div></div>';
+    }).join('');
+  }
+
+  function renderNewClientsTable(){
+    const q = (document.getElementById('search-new-clientes').value||'').trim().toUpperCase();
+    let list = pdForLists.new_clients;
+    if(q) list = list.filter(c=>c.nome.toUpperCase().includes(q));
+    const tblNew = document.getElementById('tbl-new-clients');
+    tblNew.innerHTML = '';
+    if(!list.length){
+      tblNew.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--muted);padding:16px;">Nenhum cliente novo encontrado.</td></tr>';
+    }
+    list.slice(0,200).forEach(c=>{
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td class="name-cell">'+c.nome+'</td><td class="num">'+fmtBRL(c.valor_2026)+'</td>';
+      tblNew.appendChild(tr);
+    });
+  }
+  document.getElementById('search-new-clientes').oninput = renderNewClientsTable;
+  renderNewClientsTable();
 }
 
 function renderChurnMes(pd, mKey){
